@@ -112,18 +112,19 @@ def make_sample_chain():
     for k in d["ce"]:
         tv = _theo(k, spot)
         dc = min(max(0.5 + (spot - k) / 400, 0.02), 0.98)
+        gm = round(0.0016 * math.exp(-(((spot - k) / 180) ** 2)) + 0.00005, 5)  # peaks at ATM
         chain.append({
             "strike_price": float(k),
             "underlying_spot_price": spot,
             "call_options": {
                 "market_data": {"ltp": round(max(spot - k, 0) + tv, 2), "close_price": d["close_ce"][k],
                                 "oi": d["ce"][k], "prev_oi": d["prev_ce"][k]},
-                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc, 3)},
+                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc, 3), "gamma": gm},
             },
             "put_options": {
                 "market_data": {"ltp": round(max(k - spot, 0) + tv, 2), "close_price": d["close_pe"][k],
                                 "oi": d["pe"][k], "prev_oi": d["prev_pe"][k]},
-                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc - 1, 3)},
+                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc - 1, 3), "gamma": gm},
             },
         })
     return chain
@@ -148,11 +149,15 @@ def build_df(chain):
                 "ce_day_doi": (cm.get("oi") or 0) - (cm.get("prev_oi") or 0),
                 "ce_day_px": (ce_ltp - ce_close) if ce_close else 0,
                 "ce_iv": cg.get("iv"),
+                "ce_delta": cg.get("delta") or 0,
+                "ce_gamma": cg.get("gamma") or 0,
                 "pe_ltp": pe_ltp,
                 "pe_oi": pm.get("oi") or 0,
                 "pe_day_doi": (pm.get("oi") or 0) - (pm.get("prev_oi") or 0),
                 "pe_day_px": (pe_ltp - pe_close) if pe_close else 0,
                 "pe_iv": pg.get("iv"),
+                "pe_delta": pg.get("delta") or 0,
+                "pe_gamma": pg.get("gamma") or 0,
             }
         )
     return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
@@ -205,6 +210,43 @@ def strike_changes(view, history, window, basis_day):
         po.append(p_oi_now - p_oi_old)
     v["ce_px_chg"], v["pe_px_chg"], v["ce_oi_chg"], v["pe_oi_chg"] = cp, pp, co, po
     return v
+
+
+def fast_move_symbols(v, move_pts):
+    """Rank strikes by how fast their premium should move, using delta and gamma (not displayed).
+
+    For a spot move of `move_pts` in the option's favourable direction the expected premium
+    change is |delta|*m + 0.5*gamma*m^2. Dividing by LTP gives the % speed. The fastest strikes
+    (across both CE and PE in view) get 🚀🚀, the next tier 🚀. Strikes with a tiny delta or
+    a near-zero premium are ignored so far-OTM lottery tickets do not dominate.
+    """
+    m = float(move_pts)
+    scores = {}
+    for side in ("ce", "pe"):
+        s = []
+        for d, g, p in zip(v[f"{side}_delta"], v[f"{side}_gamma"], v[f"{side}_ltp"]):
+            if p is None or p < 1 or abs(d) < 0.15 or g <= 0:
+                s.append(0.0)
+            else:
+                s.append((abs(d) * m + 0.5 * g * m * m) / p * 100)
+        scores[side] = s
+    allv = sorted([x for side in scores.values() for x in side if x > 0], reverse=True)
+    if not allv:
+        return ["" for _ in v["strike"]], ["" for _ in v["strike"]]
+    n = len(allv)
+    t_hi = allv[max(0, math.ceil(n * 0.15) - 1)]   # top ~15%
+    t_mid = allv[max(0, math.ceil(n * 0.35) - 1)]  # next ~20%
+
+    def sym(x):
+        if x <= 0:
+            return ""
+        if x >= t_hi:
+            return "🚀🚀"
+        if x >= t_mid:
+            return "🚀"
+        return ""
+
+    return [sym(x) for x in scores["ce"]], [sym(x) for x in scores["pe"]]
 
 
 def classify_buildup(px_chg, oi_chg):
@@ -360,6 +402,7 @@ window = st.sidebar.slider("Signal window (refreshes)", 2, 60, 12)
 thr_pts = st.sidebar.number_input("Spot move threshold (pts)", 1.0, 100.0, 10.0)
 sl_pct = st.sidebar.number_input("Stop-loss on bought premium (%)", 5, 90, 25)
 tgt_pct = st.sidebar.number_input("Target on bought premium (%)", 5, 300, 50)
+fast_pts = st.sidebar.slider("Fast-move test: NIFTY move (pts)", 5, 100, 20)
 
 if st.sidebar.button("Reset history"):
     st.session_state.pop("history", None)
@@ -509,16 +552,17 @@ v = strike_changes(view, hist, window, basis_day)
 v["pcr"] = [(p / c) if c else float("nan") for c, p in zip(v["ce_oi"], v["pe_oi"])]
 v["ce_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
 v["pe_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
+v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
 
 table = v.rename(columns={
     "strike": "Strike", "pcr": "PCR",
     "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_oi_chg": "CE ΔOI", "ce_px_chg": "CE Price Δ",
-    "ce_buildup": "CE Buildup", "ce_iv": "CE IV",
+    "ce_buildup": "CE Buildup", "ce_iv": "CE IV", "ce_fast": "CE Fast",
     "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
-    "pe_buildup": "PE Buildup", "pe_iv": "PE IV",
-})[["CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE LTP",
+    "pe_buildup": "PE Buildup", "pe_iv": "PE IV", "pe_fast": "PE Fast",
+})[["CE Fast", "CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE LTP",
     "Strike", "PCR",
-    "PE LTP", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup"]]
+    "PE LTP", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup", "PE Fast"]]
 
 fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
@@ -552,6 +596,11 @@ st.caption(
     "🟦 Short Covering = premium ↑ + OI ↓  |  🟧 Long Unwinding = premium ↓ + OI ↓.  "
     "Strike PCR = PE OI ÷ CE OI at that strike (green ≥ 1.2, red ≤ 0.8). "
     "Read each side on its own premium: CE Long Buildup is bullish, PE Long Buildup is bearish."
+)
+st.caption(
+    f"🚀🚀 = fastest premium mover, 🚀 = fast (blank = slow), judged from delta + gamma for a "
+    f"{fast_pts}-pt NIFTY move. CE 🚀 pays when NIFTY rises, PE 🚀 pays when NIFTY falls. "
+    "Fast also means fast on the way down, so size and stop-loss accordingly."
 )
 
 st.subheader("OI by strike")
