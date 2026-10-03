@@ -64,6 +64,17 @@ def get_chain(token, expiry):
     return api_get("/option/chain", token, {"instrument_key": NIFTY_KEY, "expiry_date": expiry})
 
 
+def get_index_quote(token):
+    """NIFTY last price and net change vs previous close (still available after market close)."""
+    data = api_get("/market-quote/quotes", token, {"instrument_key": NIFTY_KEY})
+    q = next(iter(data.values()), {}) if isinstance(data, dict) else {}
+    return {
+        "last": q.get("last_price"),
+        "net_change": q.get("net_change"),
+        "prev_close": (q.get("ohlc") or {}).get("close"),
+    }
+
+
 # ============================================================
 # SAMPLE DATA (Demo mode, same shape as the Upstox response)
 # ============================================================
@@ -304,7 +315,12 @@ if not demo and not token:
     st.info("Enter your Upstox access token, or tick Demo mode, in the sidebar.")
     st.stop()
 
-st_autorefresh(interval=refresh_s * 1000, key="auto")
+now = datetime.now(IST)
+open_now = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
+live = demo or open_now  # live = real-time mode; otherwise show last session's data
+
+# Fast refresh while the market is open; slow check while closed (switches to live by itself at 9:15 IST)
+st_autorefresh(interval=(refresh_s if live else 60) * 1000, key="auto")
 
 try:
     if demo:
@@ -326,10 +342,18 @@ if not chain:
     st.warning("No option-chain data returned.")
     st.stop()
 
-now = datetime.now(IST)
-open_now = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
-if not open_now and not demo:
-    st.warning("Market appears closed (NSE: Mon-Fri 9:15-15:30 IST). Data may be stale.")
+quote = None
+if not live:
+    st.info(
+        "🔒 Market closed (NSE Mon-Fri 9:15-15:30 IST). Showing the **last traded data** from the "
+        "previous session. The signal uses full-day OI change and the day's price change. "
+        "Live refresh starts automatically when the market opens (checked every 60 s). "
+        "On exchange holidays the data will also be from the last session."
+    )
+    try:
+        quote = get_index_quote(token)
+    except Exception:
+        quote = None  # price change just won't be shown
 
 spot = chain[0]["underlying_spot_price"]
 df = build_df(chain)
@@ -337,26 +361,45 @@ atm, view = near_atm(df, spot, n_side)
 
 # --- history (kept per browser session) ---
 hist = st.session_state.setdefault("history", [])
-if not hist or (now - hist[-1]["t"]).total_seconds() >= refresh_s * 0.8:
+if live and (not hist or (now - hist[-1]["t"]).total_seconds() >= refresh_s * 0.8):
     hist.append({"t": now, "spot": spot,
                  "oi": {r.strike: (r.ce_oi, r.pe_oi) for r in df.itertuples()}})
     del hist[:-300]
 
-chg = window_change(hist, list(view["strike"]), window)
+if live:
+    chg = window_change(hist, list(view["strike"]), window)
+else:
+    # closed market: use the full-day change reported by Upstox (OI vs previous day's OI)
+    day_spot = (quote or {}).get("net_change")
+    chg = {
+        "ce": int(view["ce_day_doi"].sum()),
+        "pe": int(view["pe_day_doi"].sum()),
+        "spot": float(day_spot) if day_spot is not None else 0.0,
+    }
+scope = "window" if live else "day"
 pcr = df["pe_oi"].sum() / df["ce_oi"].sum() if df["ce_oi"].sum() else 0
 label, score, reasons = calculate_score(chg, pcr, thr_pts)
 pattern = oi_pattern_signal(chg["spot"], chg["ce"], chg["pe"], thr_pts) if chg else "COLLECTING DATA"
 ideas, support, resist = strike_ideas(label, atm, spot, df, sl_pct, tgt_pct)
 
 # --- header metrics ---
-prev_spot = hist[-2]["spot"] if len(hist) > 1 else spot
+if live:
+    price_delta = spot - hist[-2]["spot"] if len(hist) > 1 else 0.0
+elif quote and quote.get("net_change") is not None:
+    price_delta = float(quote["net_change"])  # day change vs previous close
+else:
+    price_delta = None
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("NIFTY", f"{spot:,.2f}", f"{spot - prev_spot:+.2f}")
+c1.metric("NIFTY (last)" if not live else "NIFTY", f"{spot:,.2f}",
+          f"{price_delta:+.2f}" if price_delta is not None else None)
 c2.metric("ATM strike", f"{atm:.0f}")
 c3.metric("PCR (full chain)", f"{pcr:.2f}")
 c4.metric("Support (max PE OI)", f"{support:.0f}")
 c5.metric("Resistance (max CE OI)", f"{resist:.0f}")
-st.caption(f"Expiry {expiry}  |  Last update {now.strftime('%H:%M:%S')} IST  |  Snapshots: {len(hist)}")
+st.caption(
+    f"Expiry {expiry}  |  Checked {now.strftime('%H:%M:%S')} IST  |  "
+    + (f"Snapshots: {len(hist)}" if live else "Mode: last session (market closed)")
+)
 
 # --- signal ---
 icon = {"BULLISH": "🟢", "BEARISH": "🔴"}.get(label, "🟡")
@@ -364,9 +407,9 @@ st.subheader(f"{icon} Signal: {label}  (score {score:+d})")
 st.markdown(f"**OI pattern (original rules):** `{pattern}`")
 if chg:
     m1, m2, m3 = st.columns(3)
-    m1.metric("CE ΔOI (window)", f"{chg['ce']:+,.0f}")
-    m2.metric("PE ΔOI (window)", f"{chg['pe']:+,.0f}")
-    m3.metric("Spot move (window)", f"{chg['spot']:+.1f}")
+    m1.metric(f"CE ΔOI ({scope})", f"{chg['ce']:+,.0f}")
+    m2.metric(f"PE ΔOI ({scope})", f"{chg['pe']:+,.0f}")
+    m3.metric(f"Spot move ({scope})", f"{chg['spot']:+.1f}")
 for r in reasons:
     st.write(f"- {r}")
 
@@ -397,15 +440,21 @@ table = view.rename(columns={
 })[["Strike", "CE LTP", "CE OI", "CE ΔOI (refresh)", "CE Day ΔOI", "CE IV",
     "PE LTP", "PE OI", "PE ΔOI (refresh)", "PE Day ΔOI", "PE IV"]]
 
+if not live:  # per-refresh change is meaningless when nothing is updating
+    table = table.drop(columns=["CE ΔOI (refresh)", "PE ΔOI (refresh)"])
+
+fmt = {"Strike": "{:.0f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
+       "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
+       "CE ΔOI (refresh)": "{:+,.0f}", "PE ΔOI (refresh)": "{:+,.0f}",
+       "CE Day ΔOI": "{:+,.0f}", "PE Day ΔOI": "{:+,.0f}",
+       "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
+fmt = {k: v for k, v in fmt.items() if k in table.columns}
+
 st.dataframe(
     table.style.apply(
         lambda r: ["background-color: rgba(255,200,0,0.25)" if r["Strike"] == atm else "" for _ in r],
         axis=1,
-    ).format({"Strike": "{:.0f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
-              "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
-              "CE ΔOI (refresh)": "{:+,.0f}", "PE ΔOI (refresh)": "{:+,.0f}",
-              "CE Day ΔOI": "{:+,.0f}", "PE Day ΔOI": "{:+,.0f}",
-              "CE IV": "{:.1f}", "PE IV": "{:.1f}"}, na_rep="-"),
+    ).format(fmt, na_rep="-"),
     width="stretch",
     hide_index=True,
 )
