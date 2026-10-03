@@ -344,6 +344,41 @@ BUILDUP_STYLE = {
     "Long Unwinding": "background-color: rgba(255,140,0,0.35); font-weight: 600",
 }
 
+# --- Market View: CE + PE buildup read together (Master Combination Table) ---
+# (CE label, PE label) -> market view, exactly as in the table
+MARKET_VIEW = {
+    ("Long Buildup", "Short Buildup"): "Strong Bullish",                  # call buyers active + put writers active
+    ("Short Covering", "Short Buildup"): "Strong Bullish / Fast Upside",  # call writers trapped + put writers supporting
+    ("Long Buildup", "Long Unwinding"): "Bullish",                        # call buying + put buyers exiting
+    ("Short Covering", "Long Unwinding"): "Bullish Relief",               # call sellers exiting + fear reducing
+    ("Short Buildup", "Long Buildup"): "Strong Bearish",                  # call writers active + put buyers active
+    ("Long Unwinding", "Long Buildup"): "Bearish",                        # call buyers exiting + put buyers active
+}
+# Each side's lean, used only for combinations that are not in the table above
+CE_LEAN = {"Long Buildup": 1, "Short Covering": 1, "Short Buildup": -1, "Long Unwinding": -1}
+PE_LEAN = {"Short Buildup": 1, "Long Unwinding": 1, "Long Buildup": -1, "Short Covering": -1}
+
+
+def market_view(ce_label, pe_label):
+    """Bullish / Bearish view for one strike from its CE and PE buildup labels."""
+    if ce_label not in CE_LEAN or pe_label not in PE_LEAN:
+        return "-"
+    exact = MARKET_VIEW.get((ce_label, pe_label))
+    if exact:
+        return exact
+    total = CE_LEAN[ce_label] + PE_LEAN[pe_label]
+    if total > 0:
+        return "Bullish"
+    if total < 0:
+        return "Bearish"
+    return "Mixed - stay cautious"  # CE and PE point in opposite directions
+
+
+def market_view_text(ce_label, pe_label):
+    view = market_view(ce_label, pe_label)
+    icon = "🟢" if "Bullish" in view else "🔴" if "Bearish" in view else "🟡" if view != "-" else ""
+    return f"{icon} {view}".strip()
+
 
 # ============================================================
 # SIGNAL ENGINES
@@ -620,8 +655,11 @@ st.caption(f"Buildup basis: {basis_txt}")
 
 v = strike_changes(view, hist, window, basis_day)
 v["pcr"] = [(p / c) if c else float("nan") for c, p in zip(v["ce_oi"], v["pe_oi"])]
-v["ce_buildup"] = [buildup_text("CE", classify_buildup(px, oi)) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
-v["pe_buildup"] = [buildup_text("PE", classify_buildup(px, oi)) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
+ce_lab = [classify_buildup(px, oi) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
+pe_lab = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
+v["ce_buildup"] = [buildup_text("CE", lab) for lab in ce_lab]
+v["pe_buildup"] = [buildup_text("PE", lab) for lab in pe_lab]
+v["mkt_view"] = [market_view_text(c, p) for c, p in zip(ce_lab, pe_lab)]
 v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
 v["ce_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["ce_spread"], v["ce_spr_pct"])]
 v["pe_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["pe_spread"], v["pe_spr_pct"])]
@@ -629,13 +667,13 @@ v["ce_vol"] = [fmt_indian(x) for x in v["ce_vol"]]
 v["pe_vol"] = [fmt_indian(x) for x in v["pe_vol"]]
 
 table = v.rename(columns={
-    "strike": "Strike", "pcr": "PCR",
+    "strike": "Strike", "pcr": "PCR", "mkt_view": "Market View",
     "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_oi_chg": "CE ΔOI", "ce_px_chg": "CE Price Δ",
     "ce_buildup": "CE Buildup", "ce_fast": "CE Fast", "ce_spread": "CE Spread", "ce_vol": "CE Volume",
     "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
     "pe_buildup": "PE Buildup", "pe_fast": "PE Fast", "pe_spread": "PE Spread", "pe_vol": "PE Volume",
 })[["CE Fast", "CE Buildup", "CE ΔOI", "CE OI", "CE Volume", "CE Spread", "CE LTP",
-    "Strike", "PCR",
+    "Strike", "Market View", "PCR",
     "PE LTP", "PE Spread", "PE Volume", "PE OI", "PE ΔOI", "PE Buildup", "PE Fast"]]
 
 fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
@@ -654,6 +692,15 @@ def style_row(r):
                 s = "background-color: rgba(0,170,80,0.25)"
             elif r[col] <= 0.8:
                 s = "background-color: rgba(220,40,40,0.25)"
+        elif col == "Market View":
+            t = str(r[col])
+            strong = 0.45 if "Strong" in t else 0.25
+            if "Bullish" in t:
+                s = f"background-color: rgba(0,170,80,{strong}); font-weight: 600"
+            elif "Bearish" in t:
+                s = f"background-color: rgba(220,40,40,{strong}); font-weight: 600"
+            elif "Mixed" in t:
+                s = "background-color: rgba(150,150,150,0.30); font-weight: 600"
         out.append(s)
     return out
 
@@ -674,6 +721,26 @@ st.table(
         ],
         columns=["Label", "Option price", "OI", "CE (call) side", "PE (put) side"],
     ).set_index("Label")
+)
+st.markdown("**Market View: CE and PE read together, per strike**")
+_mv = pd.DataFrame(
+    [
+        ["CE Long Buildup", "PE Short Buildup", "Call buyers active + Put writers active", "🟢 Strong Bullish"],
+        ["CE Short Covering", "PE Short Buildup", "Call writers trapped + Put writers supporting", "🟢 Strong Bullish / Fast Upside"],
+        ["CE Long Buildup", "PE Long Unwinding", "Call buying + Put buyers exiting", "🟢 Bullish"],
+        ["CE Short Covering", "PE Long Unwinding", "Call sellers exiting + Fear reducing", "🟢 Bullish Relief"],
+        ["CE Short Buildup", "PE Long Buildup", "Call writers active + Put buyers active", "🔴 Strong Bearish"],
+        ["CE Long Unwinding", "PE Long Buildup", "Call buyers exiting + Put buyers active", "🔴 Bearish"],
+    ],
+    columns=["CE side", "PE side", "Combined meaning", "Market view"],
+)
+_mv.index = range(1, len(_mv) + 1)
+st.table(_mv)
+st.caption(
+    "Other combinations: if CE and PE point in opposite directions the view is 🟡 Mixed - stay cautious; "
+    "if both lean bearish but are not in the table (for example CE Short Buildup + PE Short Covering) it shows "
+    "🔴 Bearish. Always read CE and PE together, not separately, and follow the stronger side. "
+    "Strikes near ATM matter more than far-away strikes."
 )
 st.caption(
     "Buildup = new positions being opened. Covering / Unwinding = old positions being closed. "
