@@ -82,6 +82,13 @@ def _theo(k, spot):
     return max(4.0, 110 * math.exp(-abs(k - spot) / 160))
 
 
+def _bidask(ltp, k, spot):
+    """Synthetic bid/ask around LTP; spread is wider for strikes far from spot."""
+    pct = random.uniform(0.003, 0.010) + min(abs(k - spot) / 8000, 0.04)
+    half = max(ltp * pct, 0.05) / 2
+    return {"bid_price": round(max(ltp - half, 0.05), 2), "ask_price": round(ltp + half, 2)}
+
+
 def make_sample_chain():
     """Synthetic NIFTY chain. Spot random-walks and OI evolves on every refresh."""
     ss = st.session_state
@@ -118,12 +125,14 @@ def make_sample_chain():
             "underlying_spot_price": spot,
             "call_options": {
                 "market_data": {"ltp": round(max(spot - k, 0) + tv, 2), "close_price": d["close_ce"][k],
-                                "oi": d["ce"][k], "prev_oi": d["prev_ce"][k]},
+                                "oi": d["ce"][k], "prev_oi": d["prev_ce"][k],
+                                **_bidask(max(spot - k, 0) + tv, k, spot)},
                 "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc, 3), "gamma": gm},
             },
             "put_options": {
                 "market_data": {"ltp": round(max(k - spot, 0) + tv, 2), "close_price": d["close_pe"][k],
-                                "oi": d["pe"][k], "prev_oi": d["prev_pe"][k]},
+                                "oi": d["pe"][k], "prev_oi": d["prev_pe"][k],
+                                **_bidask(max(k - spot, 0) + tv, k, spot)},
                 "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc - 1, 3), "gamma": gm},
             },
         })
@@ -133,6 +142,15 @@ def make_sample_chain():
 # ============================================================
 # DATA HELPERS
 # ============================================================
+def _spread(md, ltp):
+    """Ask minus bid and that gap as % of LTP. NaN when the book is empty (e.g. market closed)."""
+    bid, ask = md.get("bid_price") or 0, md.get("ask_price") or 0
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return float("nan"), float("nan")
+    diff = ask - bid
+    return diff, (diff / ltp * 100 if ltp else float("nan"))
+
+
 def build_df(chain):
     rows = []
     for it in chain:
@@ -141,6 +159,8 @@ def build_df(chain):
         cg, pg = co.get("option_greeks", {}), po.get("option_greeks", {})
         ce_ltp, pe_ltp = cm.get("ltp") or 0, pm.get("ltp") or 0
         ce_close, pe_close = cm.get("close_price") or 0, pm.get("close_price") or 0
+        ce_spr, ce_spr_pct = _spread(cm, ce_ltp)
+        pe_spr, pe_spr_pct = _spread(pm, pe_ltp)
         rows.append(
             {
                 "strike": it["strike_price"],
@@ -151,6 +171,8 @@ def build_df(chain):
                 "ce_iv": cg.get("iv"),
                 "ce_delta": cg.get("delta") or 0,
                 "ce_gamma": cg.get("gamma") or 0,
+                "ce_spread": ce_spr,
+                "ce_spr_pct": ce_spr_pct,
                 "pe_ltp": pe_ltp,
                 "pe_oi": pm.get("oi") or 0,
                 "pe_day_doi": (pm.get("oi") or 0) - (pm.get("prev_oi") or 0),
@@ -158,6 +180,8 @@ def build_df(chain):
                 "pe_iv": pg.get("iv"),
                 "pe_delta": pg.get("delta") or 0,
                 "pe_gamma": pg.get("gamma") or 0,
+                "pe_spread": pe_spr,
+                "pe_spr_pct": pe_spr_pct,
             }
         )
     return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
@@ -403,6 +427,7 @@ thr_pts = st.sidebar.number_input("Spot move threshold (pts)", 1.0, 100.0, 10.0)
 sl_pct = st.sidebar.number_input("Stop-loss on bought premium (%)", 5, 90, 25)
 tgt_pct = st.sidebar.number_input("Target on bought premium (%)", 5, 300, 50)
 fast_pts = st.sidebar.slider("Fast-move test: NIFTY move (pts)", 5, 100, 20)
+wide_pct = st.sidebar.slider("Costly spread above (% of premium)", 0.5, 10.0, 2.0, 0.5)
 
 if st.sidebar.button("Reset history"):
     st.session_state.pop("history", None)
@@ -557,17 +582,18 @@ v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
 table = v.rename(columns={
     "strike": "Strike", "pcr": "PCR",
     "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_oi_chg": "CE ΔOI", "ce_px_chg": "CE Price Δ",
-    "ce_buildup": "CE Buildup", "ce_iv": "CE IV", "ce_fast": "CE Fast",
+    "ce_buildup": "CE Buildup", "ce_iv": "CE IV", "ce_fast": "CE Fast", "ce_spread": "CE Spread",
     "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
-    "pe_buildup": "PE Buildup", "pe_iv": "PE IV", "pe_fast": "PE Fast",
-})[["CE Fast", "CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE LTP",
+    "pe_buildup": "PE Buildup", "pe_iv": "PE IV", "pe_fast": "PE Fast", "pe_spread": "PE Spread",
+})[["CE Fast", "CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE Spread", "CE LTP",
     "Strike", "PCR",
-    "PE LTP", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup", "PE Fast"]]
+    "PE LTP", "PE Spread", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup", "PE Fast"]]
 
 fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
        "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}",
        "CE Price Δ": "{:+.2f}", "PE Price Δ": "{:+.2f}",
+       "CE Spread": "{:.2f}", "PE Spread": "{:.2f}",
        "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
 
 
@@ -582,6 +608,11 @@ def style_row(r):
                 s = "background-color: rgba(0,170,80,0.25)"
             elif r[col] <= 0.8:
                 s = "background-color: rgba(220,40,40,0.25)"
+        elif col in ("CE Spread", "PE Spread") and pd.notna(r[col]):
+            pct = v.loc[r.name, "ce_spr_pct" if col == "CE Spread" else "pe_spr_pct"]
+            if pd.notna(pct):  # cheap (tight) = green, costly (wide) = red
+                s = ("background-color: rgba(0,170,80,0.35); font-weight: 600" if pct <= wide_pct
+                     else "background-color: rgba(220,40,40,0.35); font-weight: 600")
         out.append(s)
     return out
 
@@ -601,6 +632,11 @@ st.caption(
     f"🚀🚀 = fastest premium mover, 🚀 = fast (blank = slow), judged from delta + gamma for a "
     f"{fast_pts}-pt NIFTY move. CE 🚀 pays when NIFTY rises, PE 🚀 pays when NIFTY falls. "
     "Fast also means fast on the way down, so size and stop-loss accordingly."
+)
+st.caption(
+    f"Spread = gap between best ask and best bid in ₹ (the cost you lose by buying and selling at once). "
+    f"🟩 green = cheap/tight (≤ {wide_pct:g}% of premium), 🟥 red = costly/wide (> {wide_pct:g}%). "
+    "'-' means no bid/ask (market closed or no quotes). Prefer green strikes for market orders."
 )
 
 st.subheader("OI by strike")
