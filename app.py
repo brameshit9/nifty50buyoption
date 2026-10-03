@@ -594,14 +594,13 @@ table = v.rename(columns={
     "ce_buildup": "CE Buildup", "ce_iv": "CE IV", "ce_fast": "CE Fast", "ce_spread": "CE Spread",
     "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
     "pe_buildup": "PE Buildup", "pe_iv": "PE IV", "pe_fast": "PE Fast", "pe_spread": "PE Spread",
-})[["CE Fast", "CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE Spread", "CE LTP",
+})[["CE Fast", "CE Buildup", "CE ΔOI", "CE OI", "CE IV", "CE Spread", "CE LTP",
     "Strike", "PCR",
-    "PE LTP", "PE Spread", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup", "PE Fast"]]
+    "PE LTP", "PE Spread", "PE IV", "PE OI", "PE ΔOI", "PE Buildup", "PE Fast"]]
 
 fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
        "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}",
-       "CE Price Δ": "{:+.2f}", "PE Price Δ": "{:+.2f}",
        "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
 
 
