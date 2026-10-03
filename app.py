@@ -78,6 +78,10 @@ def get_index_quote(token):
 # ============================================================
 # SAMPLE DATA (Demo mode, same shape as the Upstox response)
 # ============================================================
+def _theo(k, spot):
+    return max(4.0, 110 * math.exp(-abs(k - spot) / 160))
+
+
 def make_sample_chain():
     """Synthetic NIFTY chain. Spot random-walks and OI evolves on every refresh."""
     ss = st.session_state
@@ -90,6 +94,9 @@ def make_sample_chain():
             "spot": spot, "drift": random.choice([-2, 2]), "ce": ce, "pe": pe,
             "prev_ce": {k: int(v * random.uniform(0.9, 1.1)) for k, v in ce.items()},
             "prev_pe": {k: int(v * random.uniform(0.9, 1.1)) for k, v in pe.items()},
+            # previous-day close premiums so price change vs close can be computed
+            "close_ce": {k: round((max(spot - k, 0) + _theo(k, spot)) * random.uniform(0.85, 1.15), 2) for k in strikes},
+            "close_pe": {k: round((max(k - spot, 0) + _theo(k, spot)) * random.uniform(0.85, 1.15), 2) for k in strikes},
         }
     d = ss["demo"]
     if random.random() < 0.08:
@@ -103,17 +110,19 @@ def make_sample_chain():
 
     spot, chain = d["spot"], []
     for k in d["ce"]:
-        tv = max(4.0, 110 * math.exp(-abs(k - spot) / 160))
+        tv = _theo(k, spot)
         dc = min(max(0.5 + (spot - k) / 400, 0.02), 0.98)
         chain.append({
             "strike_price": float(k),
             "underlying_spot_price": spot,
             "call_options": {
-                "market_data": {"ltp": round(max(spot - k, 0) + tv, 2), "oi": d["ce"][k], "prev_oi": d["prev_ce"][k]},
+                "market_data": {"ltp": round(max(spot - k, 0) + tv, 2), "close_price": d["close_ce"][k],
+                                "oi": d["ce"][k], "prev_oi": d["prev_ce"][k]},
                 "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc, 3)},
             },
             "put_options": {
-                "market_data": {"ltp": round(max(k - spot, 0) + tv, 2), "oi": d["pe"][k], "prev_oi": d["prev_pe"][k]},
+                "market_data": {"ltp": round(max(k - spot, 0) + tv, 2), "close_price": d["close_pe"][k],
+                                "oi": d["pe"][k], "prev_oi": d["prev_pe"][k]},
                 "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc - 1, 3)},
             },
         })
@@ -129,16 +138,20 @@ def build_df(chain):
         co, po = it.get("call_options", {}), it.get("put_options", {})
         cm, pm = co.get("market_data", {}), po.get("market_data", {})
         cg, pg = co.get("option_greeks", {}), po.get("option_greeks", {})
+        ce_ltp, pe_ltp = cm.get("ltp") or 0, pm.get("ltp") or 0
+        ce_close, pe_close = cm.get("close_price") or 0, pm.get("close_price") or 0
         rows.append(
             {
                 "strike": it["strike_price"],
-                "ce_ltp": cm.get("ltp") or 0,
+                "ce_ltp": ce_ltp,
                 "ce_oi": cm.get("oi") or 0,
                 "ce_day_doi": (cm.get("oi") or 0) - (cm.get("prev_oi") or 0),
+                "ce_day_px": (ce_ltp - ce_close) if ce_close else 0,
                 "ce_iv": cg.get("iv"),
-                "pe_ltp": pm.get("ltp") or 0,
+                "pe_ltp": pe_ltp,
                 "pe_oi": pm.get("oi") or 0,
                 "pe_day_doi": (pm.get("oi") or 0) - (pm.get("prev_oi") or 0),
+                "pe_day_px": (pe_ltp - pe_close) if pe_close else 0,
                 "pe_iv": pg.get("iv"),
             }
         )
@@ -166,13 +179,59 @@ def window_change(history, strikes, window):
     return {"ce": ce, "pe": pe, "spot": cur["spot"] - base["spot"]}
 
 
-def refresh_change(history, strike):
-    """CE/PE OI change since the previous refresh for one strike (original script behaviour)."""
-    if len(history) < 2:
-        return 0, 0
-    c_now, p_now = history[-1]["oi"].get(strike, (0, 0))
-    c_old, p_old = history[-2]["oi"].get(strike, (c_now, p_now))
-    return c_now - c_old, p_now - p_old
+def strike_changes(view, history, window, basis_day):
+    """Per-strike option price change and OI change for CE and PE.
+
+    basis_day=True : price vs previous close, OI vs previous day OI (Upstox fields).
+    basis_day=False: change over the last `window` refreshes (needs history).
+    Returns the view with ce_px_chg, ce_oi_chg, pe_px_chg, pe_oi_chg columns.
+    """
+    v = view.copy()
+    if basis_day or len(history) < 2:
+        v["ce_px_chg"], v["pe_px_chg"] = v["ce_day_px"], v["pe_day_px"]
+        v["ce_oi_chg"], v["pe_oi_chg"] = v["ce_day_doi"], v["pe_day_doi"]
+        return v
+    base = history[-window - 1] if len(history) > window else history[0]
+    cur = history[-1]
+    cp, pp, co, po = [], [], [], []
+    for s in v["strike"]:
+        c_px_now, p_px_now = cur.get("px", {}).get(s, (0, 0))
+        c_px_old, p_px_old = base.get("px", {}).get(s, (c_px_now, p_px_now))
+        c_oi_now, p_oi_now = cur["oi"].get(s, (0, 0))
+        c_oi_old, p_oi_old = base["oi"].get(s, (c_oi_now, p_oi_now))
+        cp.append(c_px_now - c_px_old)
+        pp.append(p_px_now - p_px_old)
+        co.append(c_oi_now - c_oi_old)
+        po.append(p_oi_now - p_oi_old)
+    v["ce_px_chg"], v["pe_px_chg"], v["ce_oi_chg"], v["pe_oi_chg"] = cp, pp, co, po
+    return v
+
+
+def classify_buildup(px_chg, oi_chg):
+    """Classic OI interpretation, applied to the option's own premium.
+
+    Price up + OI up   -> Long Buildup
+    Price down + OI up -> Short Buildup
+    Price up + OI down -> Short Covering
+    Price down + OI down -> Long Unwinding
+    """
+    if px_chg is None or oi_chg is None or px_chg == 0 or oi_chg == 0:
+        return "-"
+    if px_chg > 0 and oi_chg > 0:
+        return "Long Buildup"
+    if px_chg < 0 and oi_chg > 0:
+        return "Short Buildup"
+    if px_chg > 0 and oi_chg < 0:
+        return "Short Covering"
+    return "Long Unwinding"
+
+
+BUILDUP_STYLE = {
+    "Long Buildup": "background-color: rgba(0,170,80,0.35); font-weight: 600",
+    "Short Buildup": "background-color: rgba(220,40,40,0.35); font-weight: 600",
+    "Short Covering": "background-color: rgba(60,130,255,0.35); font-weight: 600",
+    "Long Unwinding": "background-color: rgba(255,140,0,0.35); font-weight: 600",
+}
 
 
 # ============================================================
@@ -322,6 +381,17 @@ live = demo or open_now  # live = real-time mode; otherwise show last session's 
 # Fast refresh while the market is open; slow check while closed (switches to live by itself at 9:15 IST)
 st_autorefresh(interval=(refresh_s if live else 60) * 1000, key="auto")
 
+# Buildup basis (only meaningful while live; closed market always uses day basis)
+if live:
+    basis_choice = st.sidebar.radio(
+        "Buildup basis (chain table)",
+        ["Day (vs prev close)", "Signal window (refreshes)"],
+        index=0,
+    )
+    basis_day = basis_choice.startswith("Day")
+else:
+    basis_day = True
+
 try:
     if demo:
         st.info("🧪 Demo mode: synthetic sample data, not real market prices.")
@@ -363,7 +433,8 @@ atm, view = near_atm(df, spot, n_side)
 hist = st.session_state.setdefault("history", [])
 if live and (not hist or (now - hist[-1]["t"]).total_seconds() >= refresh_s * 0.8):
     hist.append({"t": now, "spot": spot,
-                 "oi": {r.strike: (r.ce_oi, r.pe_oi) for r in df.itertuples()}})
+                 "oi": {r.strike: (r.ce_oi, r.pe_oi) for r in df.itertuples()},
+                 "px": {r.strike: (r.ce_ltp, r.pe_ltp) for r in df.itertuples()}})
     del hist[:-300]
 
 if live:
@@ -428,35 +499,59 @@ st.caption("⚠️ Rule-based idea from OI data only, not a recommendation. Test
 
 # --- chain table ---
 st.subheader("Option chain (near ATM)")
-view = view.copy()
-view["ce_doi"] = [refresh_change(hist, s)[0] for s in view["strike"]]
-view["pe_doi"] = [refresh_change(hist, s)[1] for s in view["strike"]]
+basis_txt = "vs previous close / previous-day OI" if basis_day else f"over the last {window} refreshes"
+if not basis_day and len(hist) < 2:
+    st.caption("Collecting snapshots... showing day basis until at least 2 refreshes are stored.")
+    basis_txt = "vs previous close / previous-day OI"
+st.caption(f"Buildup basis: {basis_txt}")
 
-table = view.rename(columns={
-    "strike": "Strike", "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_doi": "CE ΔOI (refresh)",
-    "ce_day_doi": "CE Day ΔOI", "ce_iv": "CE IV",
-    "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_doi": "PE ΔOI (refresh)",
-    "pe_day_doi": "PE Day ΔOI", "pe_iv": "PE IV",
-})[["Strike", "CE LTP", "CE OI", "CE ΔOI (refresh)", "CE Day ΔOI", "CE IV",
-    "PE LTP", "PE OI", "PE ΔOI (refresh)", "PE Day ΔOI", "PE IV"]]
+v = strike_changes(view, hist, window, basis_day)
+v["pcr"] = [(p / c) if c else float("nan") for c, p in zip(v["ce_oi"], v["pe_oi"])]
+v["ce_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
+v["pe_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
 
-if not live:  # per-refresh change is meaningless when nothing is updating
-    table = table.drop(columns=["CE ΔOI (refresh)", "PE ΔOI (refresh)"])
+table = v.rename(columns={
+    "strike": "Strike", "pcr": "PCR",
+    "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_oi_chg": "CE ΔOI", "ce_px_chg": "CE Price Δ",
+    "ce_buildup": "CE Buildup", "ce_iv": "CE IV",
+    "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
+    "pe_buildup": "PE Buildup", "pe_iv": "PE IV",
+})[["CE Buildup", "CE Price Δ", "CE ΔOI", "CE OI", "CE IV", "CE LTP",
+    "Strike", "PCR",
+    "PE LTP", "PE IV", "PE OI", "PE ΔOI", "PE Price Δ", "PE Buildup"]]
 
-fmt = {"Strike": "{:.0f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
+fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
-       "CE ΔOI (refresh)": "{:+,.0f}", "PE ΔOI (refresh)": "{:+,.0f}",
-       "CE Day ΔOI": "{:+,.0f}", "PE Day ΔOI": "{:+,.0f}",
+       "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}",
+       "CE Price Δ": "{:+.2f}", "PE Price Δ": "{:+.2f}",
        "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
-fmt = {k: v for k, v in fmt.items() if k in table.columns}
+
+
+def style_row(r):
+    out = []
+    for col in r.index:
+        s = "background-color: rgba(255,200,0,0.25)" if r["Strike"] == atm else ""
+        if col in ("CE Buildup", "PE Buildup"):
+            s = BUILDUP_STYLE.get(r[col], s)
+        elif col == "PCR" and pd.notna(r[col]):
+            if r[col] >= 1.2:
+                s = "background-color: rgba(0,170,80,0.25)"
+            elif r[col] <= 0.8:
+                s = "background-color: rgba(220,40,40,0.25)"
+        out.append(s)
+    return out
+
 
 st.dataframe(
-    table.style.apply(
-        lambda r: ["background-color: rgba(255,200,0,0.25)" if r["Strike"] == atm else "" for _ in r],
-        axis=1,
-    ).format(fmt, na_rep="-"),
+    table.style.apply(style_row, axis=1).format(fmt, na_rep="-"),
     width="stretch",
     hide_index=True,
+)
+st.caption(
+    "🟩 Long Buildup = premium ↑ + OI ↑  |  🟥 Short Buildup = premium ↓ + OI ↑  |  "
+    "🟦 Short Covering = premium ↑ + OI ↓  |  🟧 Long Unwinding = premium ↓ + OI ↓.  "
+    "Strike PCR = PE OI ÷ CE OI at that strike (green ≥ 1.2, red ≤ 0.8). "
+    "Read each side on its own premium: CE Long Buildup is bullish, PE Long Buildup is bearish."
 )
 
 st.subheader("OI by strike")
