@@ -313,6 +313,30 @@ def classify_buildup(px_chg, oi_chg):
     return "Long Unwinding"
 
 
+BUILDUP_MEANING = {
+    "CE": {
+        "Long Buildup": "New call buyers",
+        "Short Buildup": "New call sellers",
+        "Short Covering": "Call sellers exiting",
+        "Long Unwinding": "Call buyers exiting",
+    },
+    "PE": {
+        "Long Buildup": "New put buyers",
+        "Short Buildup": "New put sellers",
+        "Short Covering": "Put sellers exiting",
+        "Long Unwinding": "Put buyers exiting",
+    },
+}
+BUILDUP_SEP = " - "
+
+
+def buildup_text(side, label):
+    """'Long Buildup - New call buyers' (side is 'CE' or 'PE'). '-' when there is no signal."""
+    if label not in BUILDUP_MEANING[side]:
+        return "-"
+    return f"{label}{BUILDUP_SEP}{BUILDUP_MEANING[side][label]}"
+
+
 BUILDUP_STYLE = {
     "Long Buildup": "background-color: rgba(0,170,80,0.35); font-weight: 600",
     "Short Buildup": "background-color: rgba(220,40,40,0.35); font-weight: 600",
@@ -596,8 +620,8 @@ st.caption(f"Buildup basis: {basis_txt}")
 
 v = strike_changes(view, hist, window, basis_day)
 v["pcr"] = [(p / c) if c else float("nan") for c, p in zip(v["ce_oi"], v["pe_oi"])]
-v["ce_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
-v["pe_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
+v["ce_buildup"] = [buildup_text("CE", classify_buildup(px, oi)) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
+v["pe_buildup"] = [buildup_text("PE", classify_buildup(px, oi)) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
 v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
 v["ce_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["ce_spread"], v["ce_spr_pct"])]
 v["pe_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["pe_spread"], v["pe_spr_pct"])]
@@ -624,7 +648,7 @@ def style_row(r):
     for col in r.index:
         s = "background-color: rgba(255,200,0,0.25)" if r["Strike"] == atm else ""
         if col in ("CE Buildup", "PE Buildup"):
-            s = BUILDUP_STYLE.get(r[col], s)
+            s = BUILDUP_STYLE.get(str(r[col]).split(BUILDUP_SEP)[0], s)
         elif col == "PCR" and pd.notna(r[col]):
             if r[col] >= 1.2:
                 s = "background-color: rgba(0,170,80,0.25)"
@@ -639,9 +663,20 @@ st.dataframe(
     width="stretch",
     hide_index=True,
 )
+st.markdown("**How to read the Buildup columns**")
+st.table(
+    pd.DataFrame(
+        [
+            ["🟩 Long Buildup", "↑", "↑", "New call buyers", "New put buyers"],
+            ["🟥 Short Buildup", "↓", "↑", "New call sellers", "New put sellers"],
+            ["🟦 Short Covering", "↑", "↓", "Call sellers exiting", "Put sellers exiting"],
+            ["🟧 Long Unwinding", "↓", "↓", "Call buyers exiting", "Put buyers exiting"],
+        ],
+        columns=["Label", "Option price", "OI", "CE (call) side", "PE (put) side"],
+    ).set_index("Label")
+)
 st.caption(
-    "🟩 Long Buildup = premium ↑ + OI ↑  |  🟥 Short Buildup = premium ↓ + OI ↑  |  "
-    "🟦 Short Covering = premium ↑ + OI ↓  |  🟧 Long Unwinding = premium ↓ + OI ↓.  "
+    "Buildup = new positions being opened. Covering / Unwinding = old positions being closed. "
     "Strike PCR = PE OI ÷ CE OI at that strike (green ≥ 1.2, red ≤ 0.8). "
     "Read each side on its own premium: CE Long Buildup is bullish, PE Long Buildup is bearish."
 )
