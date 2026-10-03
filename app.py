@@ -1,105 +1,175 @@
+import math
 import os
-from datetime import date, datetime
+import random
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 # ============================================================
-# PAGE SETUP
+# CONFIG
 # ============================================================
-
-st.set_page_config(page_title="NIFTY Option OI Monitor", layout="wide")
-
 BASE_URL = "https://api.upstox.com/v2"
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
+IST = ZoneInfo("Asia/Kolkata")
 
-
-# ============================================================
-# TOKEN (Streamlit secrets -> env var -> sidebar input)
-# ============================================================
-
-def load_token():
-    try:
-        if "UPSTOX_ACCESS_TOKEN" in st.secrets:
-            return st.secrets["UPSTOX_ACCESS_TOKEN"]
-    except Exception:
-        pass
-    return os.getenv("UPSTOX_ACCESS_TOKEN", "")
-
-
-with st.sidebar:
-    st.header("Settings")
-    token = load_token()
-    if not token:
-        token = st.text_input("Upstox access token", type="password")
-    poll_seconds = st.slider("Refresh every (seconds)", 3, 60, 5)
-    strikes_each_side = st.slider("Strikes each side of ATM", 3, 15, 5)
-    move_threshold = st.number_input("Price move threshold (pts)", value=5.0, step=1.0)
-    if st.button("Reset OI baseline"):
-        st.session_state.pop("previous_oi", None)
-        st.session_state.pop("previous_spot", None)
-
-if not token:
-    st.warning("Add UPSTOX_ACCESS_TOKEN in Streamlit secrets or paste it in the sidebar.")
-    st.stop()
-
-HEADERS = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+st.set_page_config(page_title="NIFTY OI Monitor", page_icon="📈", layout="wide")
 
 
 # ============================================================
 # API
 # ============================================================
+def api_get(path, token, params):
+    r = requests.get(
+        f"{BASE_URL}{path}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=10,
+    )
+    if r.status_code == 401:
+        raise PermissionError(
+            "Upstox rejected the token (401). It expires daily (~3:30 AM IST), must be the "
+            "ACCESS token (not API key/secret), and on Streamlit Cloud you must reboot the app "
+            "after editing secrets. Also clear the sidebar token box if it holds an old token."
+        )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("status") != "success":
+        raise RuntimeError(j)
+    return j["data"]
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_nearest_expiry(_token: str) -> str:
-    """Nearest upcoming NIFTY expiry as YYYY-MM-DD."""
-    r = requests.get(
-        f"{BASE_URL}/option/contract",
-        headers=HEADERS,
-        params={"instrument_key": NIFTY_KEY},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "success":
-        raise RuntimeError(data)
-    today = date.today().isoformat()
-    expiries = sorted({c["expiry"][:10] for c in data["data"] if c.get("expiry")})
-    upcoming = [e for e in expiries if e >= today]
-    if not upcoming:
-        raise RuntimeError("No upcoming expiry found")
-    return upcoming[0]
+def get_expiries(token):
+    """Upcoming NIFTY expiries (YYYY-MM-DD), nearest first."""
+    data = api_get("/option/contract", token, {"instrument_key": NIFTY_KEY})
+    today = datetime.now(IST).date()
+    out = set()
+    for c in data:
+        e = c.get("expiry")
+        if e is None:
+            continue
+        if isinstance(e, (int, float)):
+            e = datetime.fromtimestamp(e / 1000, IST).date().isoformat()
+        e = str(e)[:10]
+        if date.fromisoformat(e) >= today:
+            out.add(e)
+    return sorted(out)
 
 
-def get_option_chain(expiry: str):
-    r = requests.get(
-        f"{BASE_URL}/option/chain",
-        headers=HEADERS,
-        params={"instrument_key": NIFTY_KEY, "expiry_date": expiry},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "success":
-        raise RuntimeError(data)
-    return data["data"]
+def get_chain(token, expiry):
+    return api_get("/option/chain", token, {"instrument_key": NIFTY_KEY, "expiry_date": expiry})
 
 
 # ============================================================
-# HELPERS
+# SAMPLE DATA (Demo mode, same shape as the Upstox response)
 # ============================================================
+def make_sample_chain():
+    """Synthetic NIFTY chain. Spot random-walks and OI evolves on every refresh."""
+    ss = st.session_state
+    if "demo" not in ss:
+        spot = 24850.0
+        strikes = [24000 + 50 * i for i in range(36)]
+        ce = {k: random.randint(60_000, 250_000) + (400_000 if k in (25000, 25200) else 0) for k in strikes}
+        pe = {k: random.randint(60_000, 250_000) + (400_000 if k in (24700, 24500) else 0) for k in strikes}
+        ss["demo"] = {
+            "spot": spot, "drift": random.choice([-2, 2]), "ce": ce, "pe": pe,
+            "prev_ce": {k: int(v * random.uniform(0.9, 1.1)) for k, v in ce.items()},
+            "prev_pe": {k: int(v * random.uniform(0.9, 1.1)) for k, v in pe.items()},
+        }
+    d = ss["demo"]
+    if random.random() < 0.08:
+        d["drift"] = -d["drift"]
+    d["spot"] += random.gauss(d["drift"], 5)
+    for k in d["ce"]:
+        # uptrend -> more put writing; downtrend -> more call writing
+        d["pe"][k] += int(random.gauss(2500 if d["drift"] > 0 else 500, 1500))
+        d["ce"][k] += int(random.gauss(2500 if d["drift"] < 0 else 500, 1500))
+        d["pe"][k], d["ce"][k] = max(d["pe"][k], 0), max(d["ce"][k], 0)
 
-def get_near_atm(chain, spot, n):
-    strikes = sorted(row["strike_price"] for row in chain)
-    atm = min(strikes, key=lambda x: abs(x - spot))
-    i = strikes.index(atm)
-    selected = set(strikes[max(0, i - n): min(len(strikes), i + n + 1)])
-    return atm, [row for row in chain if row["strike_price"] in selected]
+    spot, chain = d["spot"], []
+    for k in d["ce"]:
+        tv = max(4.0, 110 * math.exp(-abs(k - spot) / 160))
+        dc = min(max(0.5 + (spot - k) / 400, 0.02), 0.98)
+        chain.append({
+            "strike_price": float(k),
+            "underlying_spot_price": spot,
+            "call_options": {
+                "market_data": {"ltp": round(max(spot - k, 0) + tv, 2), "oi": d["ce"][k], "prev_oi": d["prev_ce"][k]},
+                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc, 3)},
+            },
+            "put_options": {
+                "market_data": {"ltp": round(max(k - spot, 0) + tv, 2), "oi": d["pe"][k], "prev_oi": d["prev_pe"][k]},
+                "option_greeks": {"iv": round(random.uniform(12, 17), 2), "delta": round(dc - 1, 3)},
+            },
+        })
+    return chain
 
 
-def calculate_signal(spot_change, call_oi_change, put_oi_change, threshold):
-    if spot_change > threshold:
+# ============================================================
+# DATA HELPERS
+# ============================================================
+def build_df(chain):
+    rows = []
+    for it in chain:
+        co, po = it.get("call_options", {}), it.get("put_options", {})
+        cm, pm = co.get("market_data", {}), po.get("market_data", {})
+        cg, pg = co.get("option_greeks", {}), po.get("option_greeks", {})
+        rows.append(
+            {
+                "strike": it["strike_price"],
+                "ce_ltp": cm.get("ltp") or 0,
+                "ce_oi": cm.get("oi") or 0,
+                "ce_day_doi": (cm.get("oi") or 0) - (cm.get("prev_oi") or 0),
+                "ce_iv": cg.get("iv"),
+                "pe_ltp": pm.get("ltp") or 0,
+                "pe_oi": pm.get("oi") or 0,
+                "pe_day_doi": (pm.get("oi") or 0) - (pm.get("prev_oi") or 0),
+                "pe_iv": pg.get("iv"),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+
+
+def near_atm(df, spot, n):
+    atm = df.iloc[(df["strike"] - spot).abs().argmin()]["strike"]
+    i = df.index[df["strike"] == atm][0]
+    return atm, df.iloc[max(0, i - n): i + n + 1].copy()
+
+
+def window_change(history, strikes, window):
+    """Change in CE/PE OI over the last `window` refreshes, on a fixed set of strikes."""
+    if len(history) < 2:
+        return None
+    base = history[-window - 1] if len(history) > window else history[0]
+    cur = history[-1]
+    ce = pe = 0
+    for s in strikes:
+        c_now, p_now = cur["oi"].get(s, (0, 0))
+        c_old, p_old = base["oi"].get(s, (c_now, p_now))
+        ce += c_now - c_old
+        pe += p_now - p_old
+    return {"ce": ce, "pe": pe, "spot": cur["spot"] - base["spot"]}
+
+
+def refresh_change(history, strike):
+    """CE/PE OI change since the previous refresh for one strike (original script behaviour)."""
+    if len(history) < 2:
+        return 0, 0
+    c_now, p_now = history[-1]["oi"].get(strike, (0, 0))
+    c_old, p_old = history[-2]["oi"].get(strike, (c_now, p_now))
+    return c_now - c_old, p_now - p_old
+
+
+# ============================================================
+# SIGNAL ENGINES
+# ============================================================
+def oi_pattern_signal(spot_change, call_oi_change, put_oi_change, thr):
+    """ORIGINAL rule set from the first script (now measured over the window)."""
+    if spot_change > thr:
         if put_oi_change > 0 and call_oi_change < 0:
             return "BULLISH PRESSURE"
         if put_oi_change > 0:
@@ -107,7 +177,7 @@ def calculate_signal(spot_change, call_oi_change, put_oi_change, threshold):
         if call_oi_change > 0:
             return "WATCH CALL RESISTANCE"
         return "PRICE UP"
-    if spot_change < -threshold:
+    if spot_change < -thr:
         if call_oi_change > 0 and put_oi_change < 0:
             return "BEARISH PRESSURE"
         if call_oi_change > 0:
@@ -118,76 +188,227 @@ def calculate_signal(spot_change, call_oi_change, put_oi_change, threshold):
     return "NEUTRAL"
 
 
+def calculate_score(chg, pcr, thr_points):
+    """Score -3..+3 from spot move, OI build-up balance and PCR."""
+    if chg is None:
+        return "COLLECTING DATA", 0, ["Need at least 2 refreshes to compute change."]
+
+    score, why = 0, []
+
+    if chg["spot"] > thr_points:
+        score += 1
+        why.append(f"Spot up {chg['spot']:+.1f} pts over the window")
+    elif chg["spot"] < -thr_points:
+        score -= 1
+        why.append(f"Spot down {chg['spot']:+.1f} pts over the window")
+    else:
+        why.append(f"Spot flat ({chg['spot']:+.1f} pts)")
+
+    activity = abs(chg["ce"]) + abs(chg["pe"])
+    if activity > 0:
+        ratio = (chg["pe"] - chg["ce"]) / activity
+        if ratio > 0.2:
+            score += 1
+            why.append("Put OI building faster than Call OI (put writing = support)")
+        elif ratio < -0.2:
+            score -= 1
+            why.append("Call OI building faster than Put OI (call writing = resistance)")
+        else:
+            why.append("Call and Put OI changes are balanced")
+
+    if pcr > 1.2:
+        score += 1
+        why.append(f"PCR {pcr:.2f} (> 1.2, supportive)")
+    elif pcr < 0.8:
+        score -= 1
+        why.append(f"PCR {pcr:.2f} (< 0.8, weak)")
+    else:
+        why.append(f"PCR {pcr:.2f} (neutral)")
+
+    label = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
+    return label, score, why
+
+
 # ============================================================
-# LIVE VIEW (auto-refreshing fragment)
+# STRIKE IDEAS
 # ============================================================
+def strike_ideas(label, atm, spot, df, sl_pct, tgt_pct):
+    atm_row = df[df["strike"] == atm].iloc[0]
+    below = df[df["strike"] <= spot]
+    above = df[df["strike"] >= spot]
+    support = below.loc[below["pe_oi"].idxmax(), "strike"] if len(below) else atm
+    resist = above.loc[above["ce_oi"].idxmax(), "strike"] if len(above) else atm
 
-@st.fragment(run_every=poll_seconds)
-def live_view():
-    try:
-        expiry = get_nearest_expiry(token)
-        chain = get_option_chain(expiry)
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return
-
-    if not chain:
-        st.info("No option-chain data (market may be closed).")
-        return
-
-    spot = chain[0]["underlying_spot_price"]
-    prev_spot = st.session_state.get("previous_spot")
-    spot_change = 0.0 if prev_spot is None else spot - prev_spot
-    st.session_state["previous_spot"] = spot
-
-    atm, rows = get_near_atm(chain, spot, strikes_each_side)
-    previous_oi = st.session_state.setdefault("previous_oi", {})
-
-    table, tot_ce, tot_pe = [], 0, 0
-    for row in sorted(rows, key=lambda x: x["strike_price"]):
-        strike = row["strike_price"]
-        call = row["call_options"]["market_data"]
-        put = row["put_options"]["market_data"]
-
-        c_oi, p_oi = call.get("oi", 0) or 0, put.get("oi", 0) or 0
-        c_key, p_key = f"{strike}_CE", f"{strike}_PE"
-        c_d = c_oi - previous_oi.get(c_key, c_oi)
-        p_d = p_oi - previous_oi.get(p_key, p_oi)
-        previous_oi[c_key], previous_oi[p_key] = c_oi, p_oi
-        tot_ce += c_d
-        tot_pe += p_d
-
-        table.append({
-            "STRIKE": f"{strike:.0f}" + (" ◀ ATM" if strike == atm else ""),
-            "CE LTP": call.get("ltp", 0),
-            "CE OI": c_oi,
-            "CE ΔOI": c_d,
-            "PE LTP": put.get("ltp", 0),
-            "PE OI": p_oi,
-            "PE ΔOI": p_d,
-        })
-
-    signal = calculate_signal(spot_change, tot_ce, tot_pe, move_threshold)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("NIFTY", f"{spot:,.2f}", f"{spot_change:+.2f}")
-    c2.metric("Total CE ΔOI", f"{tot_ce:+,.0f}")
-    c3.metric("Total PE ΔOI", f"{tot_pe:+,.0f}")
-    c4.metric("Signal", signal)
-
-    st.dataframe(
-        pd.DataFrame(table),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "CE OI": st.column_config.NumberColumn(format="%d"),
-            "PE OI": st.column_config.NumberColumn(format="%d"),
-            "CE ΔOI": st.column_config.NumberColumn(format="%+d"),
-            "PE ΔOI": st.column_config.NumberColumn(format="%+d"),
-        },
-    )
-    st.caption(f"Expiry {expiry} • updated {datetime.now():%H:%M:%S} • ΔOI = change since previous refresh")
+    ideas = []
+    if label == "BULLISH":
+        p = atm_row["ce_ltp"]
+        ideas.append(("BUY", f"{atm:.0f} CE", p, p * (1 - sl_pct / 100), p * (1 + tgt_pct / 100),
+                      "ATM call for a directional bullish view."))
+        sp = df[df["strike"] == support].iloc[0]["pe_ltp"]
+        ideas.append(("SELL", f"{support:.0f} PE", sp, None, None,
+                      "Put at highest-OI support. Short options carry large risk; use a hedge/stop."))
+    elif label == "BEARISH":
+        p = atm_row["pe_ltp"]
+        ideas.append(("BUY", f"{atm:.0f} PE", p, p * (1 - sl_pct / 100), p * (1 + tgt_pct / 100),
+                      "ATM put for a directional bearish view."))
+        sp = df[df["strike"] == resist].iloc[0]["ce_ltp"]
+        ideas.append(("SELL", f"{resist:.0f} CE", sp, None, None,
+                      "Call at highest-OI resistance. Short options carry large risk; use a hedge/stop."))
+    return ideas, support, resist
 
 
-st.title("NIFTY Live Price + Option OI Monitor")
-live_view()
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.header("Settings")
+
+try:
+    default_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+except Exception:
+    default_token = ""
+default_token = (default_token or os.getenv("UPSTOX_ACCESS_TOKEN", "")).strip().strip("\"'").strip()
+
+demo = st.sidebar.checkbox("Demo mode (sample data, no token)", value=not default_token)
+token_in = st.sidebar.text_input("Upstox access token", value=default_token, type="password", disabled=demo)
+
+# clean common paste mistakes: spaces, quotes, "Bearer " prefix
+token = (token_in or "").strip().strip("\"'").strip()
+if token.lower().startswith("bearer "):
+    token = token[7:].strip()
+if token and not demo:
+    src = "secrets/env" if token == default_token else "sidebar box"
+    st.sidebar.caption(f"Using token from {src}: length {len(token)}, ends with …{token[-4:]}")
+    if len(token) < 100:
+        st.sidebar.warning(
+            "Upstox access tokens are long (200+ chars, JWT starting with 'eyJ'). "
+            "This looks like an API key/secret instead."
+        )
+
+refresh_s = st.sidebar.slider("Refresh every (sec)", 3, 60, 5)
+n_side = st.sidebar.slider("Strikes each side of ATM", 2, 15, 5)
+window = st.sidebar.slider("Signal window (refreshes)", 2, 60, 12)
+thr_pts = st.sidebar.number_input("Spot move threshold (pts)", 1.0, 100.0, 10.0)
+sl_pct = st.sidebar.number_input("Stop-loss on bought premium (%)", 5, 90, 25)
+tgt_pct = st.sidebar.number_input("Target on bought premium (%)", 5, 300, 50)
+
+if st.sidebar.button("Reset history"):
+    st.session_state.pop("history", None)
+    st.session_state.pop("demo", None)
+
+# ============================================================
+# MAIN
+# ============================================================
+st.title("📈 NIFTY 50 Live Price + Option OI Monitor")
+
+if not demo and not token:
+    st.info("Enter your Upstox access token, or tick Demo mode, in the sidebar.")
+    st.stop()
+
+st_autorefresh(interval=refresh_s * 1000, key="auto")
+
+try:
+    if demo:
+        st.info("🧪 Demo mode: synthetic sample data, not real market prices.")
+        expiry = st.sidebar.selectbox("Expiry", ["DEMO"], index=0)
+        chain = make_sample_chain()
+    else:
+        expiries = get_expiries(token)
+        if not expiries:
+            st.error("No upcoming NIFTY expiries returned.")
+            st.stop()
+        expiry = st.sidebar.selectbox("Expiry", expiries, index=0)
+        chain = get_chain(token, expiry)
+except Exception as e:
+    st.error(f"API error: {e}")
+    st.stop()
+
+if not chain:
+    st.warning("No option-chain data returned.")
+    st.stop()
+
+now = datetime.now(IST)
+open_now = now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30)
+if not open_now and not demo:
+    st.warning("Market appears closed (NSE: Mon-Fri 9:15-15:30 IST). Data may be stale.")
+
+spot = chain[0]["underlying_spot_price"]
+df = build_df(chain)
+atm, view = near_atm(df, spot, n_side)
+
+# --- history (kept per browser session) ---
+hist = st.session_state.setdefault("history", [])
+if not hist or (now - hist[-1]["t"]).total_seconds() >= refresh_s * 0.8:
+    hist.append({"t": now, "spot": spot,
+                 "oi": {r.strike: (r.ce_oi, r.pe_oi) for r in df.itertuples()}})
+    del hist[:-300]
+
+chg = window_change(hist, list(view["strike"]), window)
+pcr = df["pe_oi"].sum() / df["ce_oi"].sum() if df["ce_oi"].sum() else 0
+label, score, reasons = calculate_score(chg, pcr, thr_pts)
+pattern = oi_pattern_signal(chg["spot"], chg["ce"], chg["pe"], thr_pts) if chg else "COLLECTING DATA"
+ideas, support, resist = strike_ideas(label, atm, spot, df, sl_pct, tgt_pct)
+
+# --- header metrics ---
+prev_spot = hist[-2]["spot"] if len(hist) > 1 else spot
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("NIFTY", f"{spot:,.2f}", f"{spot - prev_spot:+.2f}")
+c2.metric("ATM strike", f"{atm:.0f}")
+c3.metric("PCR (full chain)", f"{pcr:.2f}")
+c4.metric("Support (max PE OI)", f"{support:.0f}")
+c5.metric("Resistance (max CE OI)", f"{resist:.0f}")
+st.caption(f"Expiry {expiry}  |  Last update {now.strftime('%H:%M:%S')} IST  |  Snapshots: {len(hist)}")
+
+# --- signal ---
+icon = {"BULLISH": "🟢", "BEARISH": "🔴"}.get(label, "🟡")
+st.subheader(f"{icon} Signal: {label}  (score {score:+d})")
+st.markdown(f"**OI pattern (original rules):** `{pattern}`")
+if chg:
+    m1, m2, m3 = st.columns(3)
+    m1.metric("CE ΔOI (window)", f"{chg['ce']:+,.0f}")
+    m2.metric("PE ΔOI (window)", f"{chg['pe']:+,.0f}")
+    m3.metric("Spot move (window)", f"{chg['spot']:+.1f}")
+for r in reasons:
+    st.write(f"- {r}")
+
+# --- strike ideas ---
+st.subheader("🎯 Strike ideas")
+if not ideas:
+    st.info("No directional edge right now. Staying out is a valid position.")
+else:
+    for side, strike, prem, sl, tgt, note in ideas:
+        with st.container(border=True):
+            st.markdown(f"**{side} {strike}**  @ ~₹{prem:,.2f}")
+            if sl is not None:
+                st.write(f"Stop-loss ≈ ₹{sl:,.2f}  |  Target ≈ ₹{tgt:,.2f}")
+            st.caption(note)
+st.caption("⚠️ Rule-based idea from OI data only, not a recommendation. Test on paper first; options can expire worthless.")
+
+# --- chain table ---
+st.subheader("Option chain (near ATM)")
+view = view.copy()
+view["ce_doi"] = [refresh_change(hist, s)[0] for s in view["strike"]]
+view["pe_doi"] = [refresh_change(hist, s)[1] for s in view["strike"]]
+
+table = view.rename(columns={
+    "strike": "Strike", "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_doi": "CE ΔOI (refresh)",
+    "ce_day_doi": "CE Day ΔOI", "ce_iv": "CE IV",
+    "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_doi": "PE ΔOI (refresh)",
+    "pe_day_doi": "PE Day ΔOI", "pe_iv": "PE IV",
+})[["Strike", "CE LTP", "CE OI", "CE ΔOI (refresh)", "CE Day ΔOI", "CE IV",
+    "PE LTP", "PE OI", "PE ΔOI (refresh)", "PE Day ΔOI", "PE IV"]]
+
+st.dataframe(
+    table.style.apply(
+        lambda r: ["background-color: rgba(255,200,0,0.25)" if r["Strike"] == atm else "" for _ in r],
+        axis=1,
+    ).format({"Strike": "{:.0f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
+              "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
+              "CE ΔOI (refresh)": "{:+,.0f}", "PE ΔOI (refresh)": "{:+,.0f}",
+              "CE Day ΔOI": "{:+,.0f}", "PE Day ΔOI": "{:+,.0f}",
+              "CE IV": "{:.1f}", "PE IV": "{:.1f}"}, na_rep="-"),
+    width="stretch",
+    hide_index=True,
+)
+
+st.subheader("OI by strike")
+st.bar_chart(view.set_index("strike")[["ce_oi", "pe_oi"]])
