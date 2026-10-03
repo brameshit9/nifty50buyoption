@@ -273,6 +273,13 @@ def fast_move_symbols(v, move_pts):
     return [sym(x) for x in scores["ce"]], [sym(x) for x in scores["pe"]]
 
 
+def spread_text(diff, pct, wide):
+    """Plain-text spread: '₹ gap (% of price) Cheap/Costly'. '-' when there is no bid/ask."""
+    if diff is None or pct is None or pd.isna(diff) or pd.isna(pct):
+        return "-"
+    return f"{diff:.2f} ({pct:.1f}%) {'Cheap' if pct <= wide else 'Costly'}"
+
+
 def classify_buildup(px_chg, oi_chg):
     """Classic OI interpretation, applied to the option's own premium.
 
@@ -578,6 +585,8 @@ v["pcr"] = [(p / c) if c else float("nan") for c, p in zip(v["ce_oi"], v["pe_oi"
 v["ce_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["ce_px_chg"], v["ce_oi_chg"])]
 v["pe_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v["pe_oi_chg"])]
 v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
+v["ce_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["ce_spread"], v["ce_spr_pct"])]
+v["pe_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["pe_spread"], v["pe_spr_pct"])]
 
 table = v.rename(columns={
     "strike": "Strike", "pcr": "PCR",
@@ -593,7 +602,6 @@ fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
        "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}",
        "CE Price Δ": "{:+.2f}", "PE Price Δ": "{:+.2f}",
-       "CE Spread": "{:.2f}", "PE Spread": "{:.2f}",
        "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
 
 
@@ -608,11 +616,6 @@ def style_row(r):
                 s = "background-color: rgba(0,170,80,0.25)"
             elif r[col] <= 0.8:
                 s = "background-color: rgba(220,40,40,0.25)"
-        elif col in ("CE Spread", "PE Spread") and pd.notna(r[col]):
-            pct = v.loc[r.name, "ce_spr_pct" if col == "CE Spread" else "pe_spr_pct"]
-            if pd.notna(pct):  # cheap (tight) = green, costly (wide) = red
-                s = ("background-color: rgba(0,170,80,0.35); font-weight: 600" if pct <= wide_pct
-                     else "background-color: rgba(220,40,40,0.35); font-weight: 600")
         out.append(s)
     return out
 
@@ -634,9 +637,10 @@ st.caption(
     "Fast also means fast on the way down, so size and stop-loss accordingly."
 )
 st.caption(
-    f"Spread = gap between best ask and best bid in ₹ (the cost you lose by buying and selling at once). "
-    f"🟩 green = cheap/tight (≤ {wide_pct:g}% of premium), 🟥 red = costly/wide (> {wide_pct:g}%). "
-    "'-' means no bid/ask (market closed or no quotes). Prefer green strikes for market orders."
+    "Spread = best ask minus best bid. It is shown as the ₹ gap, then the same gap as a % of the "
+    "option price in brackets (what you lose if you buy and sell straight away), then a word: "
+    f"Cheap = {wide_pct:g}% or less, Costly = more than {wide_pct:g}%. "
+    "Judge by the % and the word, not the ₹ number. '-' means no bid/ask quote (market closed)."
 )
 
 st.subheader("OI by strike")
