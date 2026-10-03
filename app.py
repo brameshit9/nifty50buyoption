@@ -86,7 +86,8 @@ def _bidask(ltp, k, spot):
     """Synthetic bid/ask around LTP; spread is wider for strikes far from spot."""
     pct = random.uniform(0.003, 0.010) + min(abs(k - spot) / 8000, 0.04)
     half = max(ltp * pct, 0.05) / 2
-    return {"bid_price": round(max(ltp - half, 0.05), 2), "ask_price": round(ltp + half, 2)}
+    vol = int(random.uniform(0.5, 1.5) * 4_000_000 * math.exp(-abs(k - spot) / 250))  # busiest near ATM
+    return {"bid_price": round(max(ltp - half, 0.05), 2), "ask_price": round(ltp + half, 2), "volume": vol}
 
 
 def make_sample_chain():
@@ -171,6 +172,7 @@ def build_df(chain):
                 "ce_iv": cg.get("iv"),
                 "ce_delta": cg.get("delta") or 0,
                 "ce_gamma": cg.get("gamma") or 0,
+                "ce_vol": cm.get("volume") or 0,
                 "ce_spread": ce_spr,
                 "ce_spr_pct": ce_spr_pct,
                 "pe_ltp": pe_ltp,
@@ -180,6 +182,7 @@ def build_df(chain):
                 "pe_iv": pg.get("iv"),
                 "pe_delta": pg.get("delta") or 0,
                 "pe_gamma": pg.get("gamma") or 0,
+                "pe_vol": pm.get("volume") or 0,
                 "pe_spread": pe_spr,
                 "pe_spr_pct": pe_spr_pct,
             }
@@ -271,6 +274,17 @@ def fast_move_symbols(v, move_pts):
         return ""
 
     return [sym(x) for x in scores["ce"]], [sym(x) for x in scores["pe"]]
+
+
+def fmt_indian(n):
+    """Volume in Indian units: 1 L = 1,00,000 and 1 Cr = 1,00,00,000."""
+    if n is None or pd.isna(n):
+        return "-"
+    if n >= 1e7:
+        return f"{n / 1e7:.2f} Cr"
+    if n >= 1e5:
+        return f"{n / 1e5:.2f} L"
+    return f"{n:,.0f}"
 
 
 def spread_text(diff, pct, wide):
@@ -587,21 +601,22 @@ v["pe_buildup"] = [classify_buildup(px, oi) for px, oi in zip(v["pe_px_chg"], v[
 v["ce_fast"], v["pe_fast"] = fast_move_symbols(v, fast_pts)
 v["ce_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["ce_spread"], v["ce_spr_pct"])]
 v["pe_spread"] = [spread_text(d, p, wide_pct) for d, p in zip(v["pe_spread"], v["pe_spr_pct"])]
+v["ce_vol"] = [fmt_indian(x) for x in v["ce_vol"]]
+v["pe_vol"] = [fmt_indian(x) for x in v["pe_vol"]]
 
 table = v.rename(columns={
     "strike": "Strike", "pcr": "PCR",
     "ce_ltp": "CE LTP", "ce_oi": "CE OI", "ce_oi_chg": "CE ΔOI", "ce_px_chg": "CE Price Δ",
-    "ce_buildup": "CE Buildup", "ce_iv": "CE IV", "ce_fast": "CE Fast", "ce_spread": "CE Spread",
+    "ce_buildup": "CE Buildup", "ce_fast": "CE Fast", "ce_spread": "CE Spread", "ce_vol": "CE Volume",
     "pe_ltp": "PE LTP", "pe_oi": "PE OI", "pe_oi_chg": "PE ΔOI", "pe_px_chg": "PE Price Δ",
-    "pe_buildup": "PE Buildup", "pe_iv": "PE IV", "pe_fast": "PE Fast", "pe_spread": "PE Spread",
-})[["CE Fast", "CE Buildup", "CE ΔOI", "CE OI", "CE IV", "CE Spread", "CE LTP",
+    "pe_buildup": "PE Buildup", "pe_fast": "PE Fast", "pe_spread": "PE Spread", "pe_vol": "PE Volume",
+})[["CE Fast", "CE Buildup", "CE ΔOI", "CE OI", "CE Volume", "CE Spread", "CE LTP",
     "Strike", "PCR",
-    "PE LTP", "PE Spread", "PE IV", "PE OI", "PE ΔOI", "PE Buildup", "PE Fast"]]
+    "PE LTP", "PE Spread", "PE Volume", "PE OI", "PE ΔOI", "PE Buildup", "PE Fast"]]
 
 fmt = {"Strike": "{:.0f}", "PCR": "{:.2f}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
        "CE OI": "{:,.0f}", "PE OI": "{:,.0f}",
-       "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}",
-       "CE IV": "{:.1f}", "PE IV": "{:.1f}"}
+       "CE ΔOI": "{:+,.0f}", "PE ΔOI": "{:+,.0f}"}
 
 
 def style_row(r):
@@ -640,6 +655,10 @@ st.caption(
     "option price in brackets (what you lose if you buy and sell straight away), then a word: "
     f"Cheap = {wide_pct:g}% or less, Costly = more than {wide_pct:g}%. "
     "Judge by the % and the word, not the ₹ number. '-' means no bid/ask quote (market closed)."
+)
+st.caption(
+    "Volume = contracts traded today, shown in lakhs (L) and crores (Cr): "
+    "1 L = 1,00,000 and 1 Cr = 1,00,00,000."
 )
 
 st.subheader("OI by strike")
